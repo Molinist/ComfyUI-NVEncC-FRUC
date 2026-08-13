@@ -32,6 +32,7 @@ DATE_FORMAT_PART = re.compile("|".join(DATE_FORMAT_PARTS))
 NVEncCFilters = io.Custom("NVENCC_FILTERS")
 NVENCC_FILTER_ARGUMENTS = (
     ("unsharp", "--vpp-unsharp"),
+    ("edgelevel", "--vpp-edgelevel"),
     ("msharpen", "--vpp-msharpen"),
     ("cas", "--vpp-cas"),
     ("detailsharpen", "--vpp-detailsharpen"),
@@ -386,17 +387,24 @@ class NVEncCCAS(io.ComfyNode):
             node_id="NVEncCCAS",
             display_name="NVEncC Sharpen (CAS)",
             category="video/nvencc",
-            description="Adds restrained, contrast-adaptive luma sharpening to an NVEncC filter chain. CAS emphasizes existing edges without resizing or reconstructing lost detail.",
+            description="Adds restrained, contrast-adaptive sharpening to an NVEncC filter chain. CAS sharpens luma by default, can use its HDR response for PQ or HLG sources, and can optionally process chroma.",
             inputs=[
                 NVEncCFilters.Input("filters", optional=True, tooltip="Optional existing NVEncC filter chain. Disconnected starts a new chain; connected preserves other stages and replaces an earlier CAS stage."),
                 io.Float.Input("strength", default=0.4, min=0.0, max=1.0, step=0.05, tooltip="CAS sharpness from 0 to 1. Around 0.2-0.4 is subtle; values near 1 can emphasize noise and compression artifacts. 0 still includes a zero-strength CAS stage."),
+                io.Boolean.Input("hdr", display_name="HDR source", default=False, tooltip="True skips CAS's SDR gamma approximation for PQ or HLG HDR sources; false uses the normal SDR response."),
+                io.Boolean.Input("chroma", display_name="sharpen chroma", default=False, tooltip="True sharpens chroma planes as well as luma and may emphasize color noise or ringing; false sharpens luma only."),
             ],
             outputs=[NVEncCFilters.Output("filters", tooltip="NVEncC filter chain containing CAS for connection to another suite filter or Save Video with NVEncC.")],
         )
 
     @classmethod
-    def execute(cls, strength, filters=None):
-        return io.NodeOutput(add_nvencc_filter(filters, "cas", f"sharpness={strength:g}"))
+    def execute(cls, strength, filters=None, hdr=False, chroma=False):
+        parameters = [f"sharpness={strength:g}"]
+        if hdr:
+            parameters.append("hdr=true")
+        if chroma:
+            parameters.append("chroma=true")
+        return io.NodeOutput(add_nvencc_filter(filters, "cas", ",".join(parameters)))
 
 
 class NVEncCUnsharp(io.ComfyNode):
@@ -419,6 +427,30 @@ class NVEncCUnsharp(io.ComfyNode):
     @classmethod
     def execute(cls, radius, weight, threshold, filters=None):
         return io.NodeOutput(add_nvencc_filter(filters, "unsharp", f"radius={radius},weight={weight:g},threshold={threshold:g}"))
+
+
+class NVEncCEdgeLevel(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="NVEncCEdgeLevel",
+            display_name="NVEncC Sharpen (EdgeLevel)",
+            category="video/nvencc",
+            description="Adds direct edge-level sharpening to an NVEncC filter chain. Separate dark- and bright-edge controls can emphasize outlines, while excessive values can create halos or crush fine edge transitions.",
+            inputs=[
+                NVEncCFilters.Input("filters", optional=True, tooltip="Optional existing NVEncC filter chain. Disconnected starts a new chain; connected preserves other stages and replaces an earlier EdgeLevel stage."),
+                io.Float.Input("strength", default=5.0, min=-31.0, max=31.0, step=0.5, tooltip="Edge-sharpening strength from -31 to 31. Larger positive values produce stronger sharpening; 5 is NVEncC's default."),
+                io.Float.Input("threshold", default=20.0, min=0.0, max=255.0, step=1.0, tooltip="Noise threshold in 8-bit luma levels. Higher values exclude progressively larger brightness changes from edge enhancement."),
+                io.Float.Input("black", default=0.0, min=0.0, max=31.0, step=0.5, tooltip="Additional dark-side edge emphasis from 0 to 31. Higher values deepen dark outlines and increase dark-halo risk."),
+                io.Float.Input("white", default=0.0, min=0.0, max=31.0, step=0.5, tooltip="Additional bright-side edge emphasis from 0 to 31. Higher values brighten edge highlights and increase bright-halo risk."),
+            ],
+            outputs=[NVEncCFilters.Output("filters", tooltip="NVEncC filter chain containing EdgeLevel for connection to another suite filter or Save Video with NVEncC.")],
+        )
+
+    @classmethod
+    def execute(cls, strength, threshold, black, white, filters=None):
+        parameters = f"strength={strength:g},threshold={threshold:g},black={black:g},white={white:g}"
+        return io.NodeOutput(add_nvencc_filter(filters, "edgelevel", parameters))
 
 
 class NVEncCMSharpen(io.ComfyNode):
@@ -634,6 +666,7 @@ class NVEncCFRUCExtension(ComfyExtension):
             NVEncCFrameDouble,
             NVEncCCAS,
             NVEncCUnsharp,
+            NVEncCEdgeLevel,
             NVEncCMSharpen,
             NVEncCDetailSharpen,
             SaveVideoNVEncCFRUC,

@@ -10,17 +10,20 @@ The save node accepts ComfyUI's native `VIDEO` type directly. A video from `Load
 - **NVEncC Frame Double (FRUC)** inserts one generated frame between each source-frame pair, doubling FPS without changing duration.
 - **NVEncC Sharpen (CAS)** applies restrained contrast-adaptive sharpening.
 - **NVEncC Sharpen (Unsharp)** provides direct, visibly aggressive edge enhancement.
+- **NVEncC Sharpen (EdgeLevel)** strengthens detected edges with separate dark- and bright-side emphasis.
 - **NVEncC Sharpen (MSharpen)** sharpens detected edges with dark-area and compression-block protection.
 - **NVEncC Sharpen (DetailSharpen)** enhances fine texture with nonlinear damping controls.
 
 Each processing feature is its own node. Leaving a filter node out disables that feature completely. Connect filter nodes through their `filters` sockets, then connect the final chain to `Save Video with NVEncC`.
+
+Filter nodes build a deferred NVEncC recipe; they do not encode or materialize another video by themselves. The save node executes the complete chain once, avoiding an intermediate encode for every filter. Frame doubling is off unless `NVEncC Frame Double (FRUC)` is present in the connected chain. The save node's FPS widget only sets the frame rate for `IMAGE` batches and does not enable FRUC; native `VIDEO` input keeps its source FPS.
 
 ```text
 Load Video (VIDEO) --------------------------------> Save Video with NVEncC (video / images)
 NVEncC Sharpen (MSharpen) -> NVEncC Frame Double -> Save Video with NVEncC (filters)
 ```
 
-Filters execute in NVEncC's supported order: Unsharp, MSharpen, CAS, DetailSharpen, then FRUC. Wiring the same filter type more than once makes the later node replace that stage rather than applying it twice.
+Filters execute in NVEncC's supported order: Unsharp, EdgeLevel, MSharpen, CAS, DetailSharpen, then FRUC. Wiring the same filter type more than once makes the later node replace that stage rather than applying it twice.
 
 The former **Save Video with NVEncC (Legacy All-in-One)** remains registered under `video/nvencc/legacy` so existing workflows, embedded media metadata, and long-lived browser tabs continue to load. Use the suite nodes for new workflows.
 
@@ -36,8 +39,9 @@ The former **Save Video with NVEncC (Legacy All-in-One)** remains registered und
 
 ## Sharpening guide
 
-- **CAS:** subtle and adaptive. Start around `0.2-0.4`.
+- **CAS:** subtle and adaptive. Start around `0.2-0.4`; enable HDR for PQ/HLG input, and enable chroma only when colored detail needs sharpening.
 - **Unsharp:** the clearest before/after demonstration. Start at radius `3`, weight `0.5`, threshold `10`, then raise weight carefully.
+- **EdgeLevel:** direct outline enhancement with separate dark and bright edge controls. Start at strength `5`, threshold `20`, and leave black/white at `0` until needed.
 - **MSharpen:** a strong general-purpose choice for compressed video. Its protection controls can reduce dark-noise and block enhancement.
 - **DetailSharpen:** emphasizes fine texture. Increase damping if grain or compression texture becomes prominent.
 

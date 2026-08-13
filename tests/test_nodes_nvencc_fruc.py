@@ -12,6 +12,7 @@ import nodes_nvencc_fruc as nvencc_module
 from nodes_nvencc_fruc import (
     NVEncCCAS,
     NVEncCDetailSharpen,
+    NVEncCEdgeLevel,
     NVEncCFrameDouble,
     NVEncCMSharpen,
     NVEncCUnsharp,
@@ -138,14 +139,16 @@ def test_build_command_adds_independent_advanced_sharpening_filters(tmp_path):
 def test_suite_filter_nodes_compose_and_replace_matching_stage():
     filters = NVEncCCAS.execute(0.3).args[0]
     filters = NVEncCUnsharp.execute(3, 0.5, 10.0, filters).args[0]
+    filters = NVEncCEdgeLevel.execute(5.0, 20.0, 2.0, 1.0, filters).args[0]
     filters = NVEncCMSharpen.execute(0.8, 10.0, 0.0, 16.0, 0.5, True, filters).args[0]
     filters = NVEncCDetailSharpen.execute(4.0, 1.5, 4.0, 1.0, "box", False, filters).args[0]
     filters = NVEncCFrameDouble.execute(filters).args[0]
-    filters = NVEncCCAS.execute(0.6, filters).args[0]
+    filters = NVEncCCAS.execute(0.6, filters, hdr=True, chroma=True).args[0]
 
     assert filters == {
-        "cas": "sharpness=0.6",
+        "cas": "sharpness=0.6,hdr=true,chroma=true",
         "unsharp": "radius=3,weight=0.5,threshold=10",
+        "edgelevel": "strength=5,threshold=20,black=2,white=1",
         "msharpen": "strength=0.8,threshold=10,slope=0,luma_limit=16,block_protect=0.5,highq=true",
         "detailsharpen": "z=4,sstr=1.5,power=4,ldmp=1,mode=1,med=false",
         "fruc": "double",
@@ -158,12 +161,13 @@ def test_build_command_emits_suite_filters_in_nvencc_order(tmp_path):
         "detailsharpen": "z=4,sstr=1.5,power=4,ldmp=1,mode=1,med=false",
         "cas": "sharpness=0.4",
         "msharpen": "strength=0.8,threshold=10",
+        "edgelevel": "strength=5,threshold=20,black=0,white=0",
         "unsharp": "radius=3,weight=0.5,threshold=10",
     }
 
     command = build_command("NVEncC64.exe", str(tmp_path / "output.mkv"), "h264", "p4", 20.0, fruc=False, filters=filters)
 
-    arguments = [command.index(name) for name in ("--vpp-unsharp", "--vpp-msharpen", "--vpp-cas", "--vpp-detailsharpen", "--vpp-fruc")]
+    arguments = [command.index(name) for name in ("--vpp-unsharp", "--vpp-edgelevel", "--vpp-msharpen", "--vpp-cas", "--vpp-detailsharpen", "--vpp-fruc")]
     assert arguments == sorted(arguments)
 
 
@@ -285,8 +289,9 @@ def test_suite_node_schemas_are_stable_and_fully_documented():
     expected_inputs = {
         SaveVideoNVEncC: ["images", "filters", "fps", "filename_prefix", "container", "codec", "preset", "quality", "input_decoder", "nvencc_path", "audio"],
         NVEncCFrameDouble: ["filters"],
-        NVEncCCAS: ["filters", "strength"],
+        NVEncCCAS: ["filters", "strength", "hdr", "chroma"],
         NVEncCUnsharp: ["filters", "radius", "weight", "threshold"],
+        NVEncCEdgeLevel: ["filters", "strength", "threshold", "black", "white"],
         NVEncCMSharpen: ["filters", "strength", "threshold", "slope", "luma_limit", "block_protect", "high_quality"],
         NVEncCDetailSharpen: ["filters", "zero_point", "strength", "power", "damping", "blur_mode", "median"],
     }
@@ -308,6 +313,10 @@ def test_suite_node_schemas_are_stable_and_fully_documented():
     assert all(option in detail_inputs["blur_mode"].tooltip.lower() for option in ("box", "gaussian"))
     assert "true" in detail_inputs["median"].tooltip.lower()
     assert "false" in detail_inputs["median"].tooltip.lower()
+    cas_inputs = {input.id: input for input in NVEncCCAS.define_schema().inputs}
+    for input_id in ("hdr", "chroma"):
+        assert "true" in cas_inputs[input_id].tooltip.lower()
+        assert "false" in cas_inputs[input_id].tooltip.lower()
 
 
 def test_real_loader_registers_node_and_frontend(monkeypatch):
@@ -321,11 +330,11 @@ def test_real_loader_registers_node_and_frontend(monkeypatch):
 
     assert asyncio.run(nodes.load_custom_node(str(module_path)))
     assert {
-        "SaveVideoNVEncC", "NVEncCFrameDouble", "NVEncCCAS", "NVEncCUnsharp", "NVEncCMSharpen",
+        "SaveVideoNVEncC", "NVEncCFrameDouble", "NVEncCCAS", "NVEncCUnsharp", "NVEncCEdgeLevel", "NVEncCMSharpen",
         "NVEncCDetailSharpen", "SaveVideoNVEncCFRUC", "NVEncCFRUCTailBridge",
     }.issubset(nodes.NODE_CLASS_MAPPINGS)
     for node_id in (
-        "SaveVideoNVEncC", "NVEncCFrameDouble", "NVEncCCAS", "NVEncCUnsharp", "NVEncCMSharpen",
+        "SaveVideoNVEncC", "NVEncCFrameDouble", "NVEncCCAS", "NVEncCUnsharp", "NVEncCEdgeLevel", "NVEncCMSharpen",
         "NVEncCDetailSharpen", "SaveVideoNVEncCFRUC", "NVEncCFRUCTailBridge",
     ):
         assert nodes.NODE_CLASS_MAPPINGS[node_id].RELATIVE_PYTHON_MODULE == f"custom_nodes.{module_path.name}"

@@ -1,6 +1,6 @@
 [project]
 name = "nvencc-suite"
-version = "0.1.0"
+version = "0.2.0"
 description = "Composable ComfyUI nodes for NVEncC encoding, FRUC frame interpolation, and video sharpening."
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
