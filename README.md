@@ -8,7 +8,7 @@ The save node accepts ComfyUI's native `VIDEO` type directly. A video from `Load
 
 - **Save Video with NVEncC** encodes a native `VIDEO` or `IMAGE` batch and accepts an optional filter chain.
 - **Load GIF as Video** exposes an animated GIF in ComfyUI's input folder as a native `VIDEO` handle.
-- **Convert Video to GIF (FFmpeg)** palette-encodes a `VIDEO` as GIF in memory and passes it to another `VIDEO` node without saving a GIF.
+- **Convert Video to GIF (FFmpeg)** applies GIF palette dithering in memory and passes a `VIDEO` with source audio when present, without saving a GIF file.
 - **Save GIF with FFmpeg** creates a palette-dithered GIF from a `VIDEO` and returns the saved GIF as `VIDEO`.
 - **NVEncC Frame Double (FRUC)** inserts one generated frame between each source-frame pair, doubling FPS without changing duration.
 - **NVEncC Upscale (NGX VSR)** enlarges low-resolution video with NVIDIA RTX Video Super Resolution while preserving aspect ratio.
@@ -45,9 +45,11 @@ The former **Save Video with NVEncC (Legacy All-in-One)** remains registered und
 
 ## GIF input and output
 
-`Load GIF as Video` → `Save Video with NVEncC` → `Convert Video to GIF (FFmpeg)` runs the selected NVEncC upscale, sharpen, and FRUC filters, then passes a GIF-dithered `VIDEO` handle to another node without writing a GIF to the output folder. Connect the filters to the NVEncC save node as usual. When the converter's input VIDEO has audio, its single VIDEO output carries the dithered frames as FFV1 alongside the original audio in memory; connect it directly to `Save Video with NVEncC` to keep the audio. Without audio, the output is an ordinary GIF. Use `Save GIF with FFmpeg` when a GIF file should be kept in the output folder. For GIF-to-GIF palette conversion without NVEncC filters, connect the loader directly to either GIF node.
+Connect `Load Video` → `Convert Video to GIF (FFmpeg)` → `Save Video with NVEncC` with one `VIDEO` wire at each step. The converter applies the selected GIF palette and dithering. If the source has audio, it returns an in-memory Matroska `VIDEO` with FFV1 frames and the original audio; the NVEncC save node copies that audio into the encoded output. If the source is silent, the converter returns an ordinary GIF in memory. It does not save a GIF file.
 
-Both GIF conversion nodes have an explicit dither selector: `sierra2_4a`, `bayer`, `heckbert`, `floyd_steinberg`, `sierra2`, `sierra3`, `burkes`, `atkinson`, or `none`. Their Bayer scale control applies only when `bayer` is selected. FFmpeg must be on `PATH`, set through `FFMPEG_PATH`, or supplied in the node's `ffmpeg_path` field. A standalone GIF cannot carry audio; `Save GIF with FFmpeg` drops it. GIF frame delays use centiseconds and FFmpeg may shift individual delays slightly. NVEncC pads odd GIF dimensions by one pixel using FFmpeg before encoding; its video path discards GIF transparency. Saving the same clip as MP4/MKV remains the NVEncC save node's job.
+For GIF input, connect `Load GIF as Video` to `Save Video with NVEncC`, chain the NGX VSR, sharpening, and FRUC filter nodes, and connect the final `filters` output to that save node. Use `Save GIF with FFmpeg` when you want a GIF file in ComfyUI's output folder. A GIF source has no embedded audio; connect an external `AUDIO` to the save node if needed.
+
+Both GIF conversion nodes have an explicit dither selector: `sierra2_4a`, `bayer`, `heckbert`, `floyd_steinberg`, `sierra2`, `sierra3`, `burkes`, `atkinson`, or `none`. Their Bayer scale control applies only when `bayer` is selected. FFmpeg must be on `PATH`, set through `FFMPEG_PATH`, or supplied in the node's `ffmpeg_path` field. `Save GIF with FFmpeg` drops audio. GIF frame delays use centiseconds and FFmpeg may shift individual delays slightly. NVEncC pads odd GIF dimensions by one pixel using FFmpeg before encoding; its video path discards GIF transparency. Saving the same clip as MP4/MKV remains the NVEncC save node's job.
 
 ## Upscaling guide
 
@@ -74,6 +76,7 @@ Strong filters or stacked sharpen stages can create halos, ringing, block emphas
 - **NVIDIA GPU with NVENC** for encoding. FRUC additionally requires NVIDIA Optical Flow support (Turing / RTX 20-series or newer, subject to the GPU's capabilities). AMD, Intel and CPU-only systems cannot run this backend.
 - **A current NVIDIA driver compatible with your GPU and NVEncC build.** Upstream lists 528.24 as the FRUC feature's historical minimum; newer NVEncC builds can require a newer driver, so that number is not a sufficient installation target.
 - **NVEncC for Windows x64**, installed separately as described below. The Python node repository does not include or download the executable or its DLLs.
+- **FFmpeg executable** for GIF conversion and odd-sized GIF padding. Install it separately and provide `ffmpeg.exe` on `PATH`, through `FFMPEG_PATH`, or in the GIF node's `ffmpeg_path` field.
 
 See [upstream FRUC requirements](https://github.com/rigaya/NVEnc/blob/master/NVEncC_Options.ja.md#--vpp-fruc-param1value1param2value2).
 
@@ -132,6 +135,8 @@ Executable discovery checks, in order:
 4. `ComfyUI/tools/NVEncC64.exe`
 5. The system `PATH`
 
+For GIF workflows, check FFmpeg in PowerShell with `ffmpeg -version` before launching ComfyUI. If it is installed outside `PATH`, set `FFMPEG_PATH` to the full path to `ffmpeg.exe` before launching ComfyUI, or use the GIF node's advanced `ffmpeg_path` field.
+
 ### 3. Check NVEncC before opening a workflow
 
 In PowerShell, from the ComfyUI folder:
@@ -168,7 +173,7 @@ The save node's **FPS widget does not change native VIDEO timing or enable inter
 
 Once that works, optionally connect a sharpening node before FRUC through the `filters` sockets. Filters carry a processing recipe, not video frames.
 
-**Output limits:** the current save implementation requests **8-bit BT.709** output. It is not an HDR-preserving export or an HDR-to-SDR tone-mapping workflow. CAS's `HDR source` control only changes that filter's response. The suite does not upscale resolution, and FRUC may produce artifacts around occlusion or complex motion.
+**Output limits:** the current save implementation requests **8-bit BT.709** output. It is not an HDR-preserving export or an HDR-to-SDR tone-mapping workflow. CAS's `HDR source` control only changes that filter's response. Resolution changes only when the NGX VSR filter is connected. FRUC may produce artifacts around occlusion or complex motion.
 
 ## Troubleshooting
 
@@ -181,7 +186,7 @@ Once that works, optionally connect a sharpening node before FRUC through the `f
 | Unsupported codec / encoder initialization error | Start with `h264`; AV1 encoding is not available on every NVIDIA GPU. Run `--check-features` and check the driver requirement of your NVEncC release. |
 | Hardware decoding fails for the input | Change `input_decoder` to `software`. Encoding and FRUC still require the NVIDIA GPU. |
 | Unknown sharpening option | Update NVEncC; loading the Python nodes does not prove an older executable supports every filter option. |
-| Width or height must be even | Resize or crop to even dimensions before this node; its YUV420 path rejects odd dimensions. |
+| Width or height must be even | GIF and in-memory FFV1 output from the GIF converter are padded to even dimensions. Resize or crop other video and `IMAGE` inputs to even dimensions before encoding. |
 | FPS stays unchanged | Connect the FRUC filter. Changing the FPS widget has no effect on native `VIDEO` input. |
 | Audio fails to mux into MP4 | Try `mkv` for source-audio passthrough, or connect a replacement `AUDIO` input, which is encoded as AAC. |
 | Duplicate or unexpected nodes | Keep one installed copy; remove the duplicate installation rather than installing over it. |
