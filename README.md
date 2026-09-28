@@ -1,18 +1,23 @@
 # ComfyUI NVEncC Suite
 
-Composable ComfyUI nodes for NVEncC encoding, NVIDIA Optical Flow frame-rate up-conversion, and GPU video sharpening.
+Composable ComfyUI nodes for NVEncC encoding, NVIDIA RTX video upscaling, Optical Flow frame-rate up-conversion, and GPU video sharpening.
 
 The save node accepts ComfyUI's native `VIDEO` type directly. A video from `Load Video` goes to NVEncC as its original file instead of first becoming one large `IMAGE` tensor. Generated `IMAGE` batches remain supported through a streamed Y4M path.
 
 ## Suite nodes
 
 - **Save Video with NVEncC** encodes a native `VIDEO` or `IMAGE` batch and accepts an optional filter chain.
+- **Load GIF as Video** exposes an animated GIF in ComfyUI's input folder as a native `VIDEO` handle.
+- **Convert Video to GIF (FFmpeg)** palette-encodes a `VIDEO` as GIF in memory and passes it to another `VIDEO` node without saving a GIF.
+- **Save GIF with FFmpeg** creates a palette-dithered GIF from a `VIDEO` and returns the saved GIF as `VIDEO`.
 - **NVEncC Frame Double (FRUC)** inserts one generated frame between each source-frame pair, doubling FPS without changing duration.
+- **NVEncC Upscale (NGX VSR)** enlarges low-resolution video with NVIDIA RTX Video Super Resolution while preserving aspect ratio.
 - **NVEncC Sharpen (CAS)** applies restrained contrast-adaptive sharpening.
 - **NVEncC Sharpen (Unsharp)** provides direct, visibly aggressive edge enhancement.
 - **NVEncC Sharpen (EdgeLevel)** strengthens detected edges with separate dark- and bright-side emphasis.
 - **NVEncC Sharpen (MSharpen)** sharpens detected edges with dark-area and compression-block protection.
 - **NVEncC Sharpen (DetailSharpen)** enhances fine texture with nonlinear damping controls.
+- **NVEncC Sharpen (WarpSharp)** tightens outlines by warping pixels toward detected edges, with optional adaptive depth.
 
 Each processing feature is its own node. Leaving a filter node out disables that feature completely. Connect filter nodes through their `filters` sockets, then connect the final chain to `Save Video with NVEncC`.
 
@@ -23,7 +28,7 @@ Load Video (VIDEO) --------------------------------> Save Video with NVEncC (vid
 NVEncC Sharpen (MSharpen) -> NVEncC Frame Double -> Save Video with NVEncC (filters)
 ```
 
-Filters execute in NVEncC's supported order: Unsharp, EdgeLevel, MSharpen, CAS, DetailSharpen, then FRUC. Wiring the same filter type more than once makes the later node replace that stage rather than applying it twice.
+Filters execute in NVEncC's supported order: NGX VSR, Unsharp, EdgeLevel, MSharpen, CAS, DetailSharpen, WarpSharp, then FRUC. Wiring the same filter type more than once makes the later node replace that stage rather than applying it twice.
 
 The former **Save Video with NVEncC (Legacy All-in-One)** remains registered under `video/nvencc/legacy` so existing workflows, embedded media metadata, and long-lived browser tabs continue to load. Use the suite nodes for new workflows.
 
@@ -32,10 +37,25 @@ The former **Save Video with NVEncC (Legacy All-in-One)** remains registered und
 ## Save behavior
 
 - Hardware video decoding is the default; software decoding is available for source codecs unsupported by the GPU.
+- GIF input automatically uses NVEncC's FFmpeg software decoder.
 - `VIDEO` input keeps source FPS, trim ranges, and embedded audio. Connecting audio replaces the source audio.
 - The FPS widget applies only to `IMAGE` batches.
 - AV1, HEVC, and H.264 output are supported in MP4 or MKV.
 - With no filter chain connected, the save node performs encoding only.
+
+## GIF input and output
+
+`Load GIF as Video` → `Save Video with NVEncC` → `Convert Video to GIF (FFmpeg)` runs the selected NVEncC upscale, sharpen, and FRUC filters, then passes a GIF-dithered `VIDEO` handle to another node without writing a GIF to the output folder. Connect the filters to the NVEncC save node as usual. When the converter's input VIDEO has audio, its single VIDEO output carries the dithered frames as FFV1 alongside the original audio in memory; connect it directly to `Save Video with NVEncC` to keep the audio. Without audio, the output is an ordinary GIF. Use `Save GIF with FFmpeg` when a GIF file should be kept in the output folder. For GIF-to-GIF palette conversion without NVEncC filters, connect the loader directly to either GIF node.
+
+Both GIF conversion nodes have an explicit dither selector: `sierra2_4a`, `bayer`, `heckbert`, `floyd_steinberg`, `sierra2`, `sierra3`, `burkes`, `atkinson`, or `none`. Their Bayer scale control applies only when `bayer` is selected. FFmpeg must be on `PATH`, set through `FFMPEG_PATH`, or supplied in the node's `ffmpeg_path` field. A standalone GIF cannot carry audio; `Save GIF with FFmpeg` drops it. GIF frame delays use centiseconds and FFmpeg may shift individual delays slightly. NVEncC pads odd GIF dimensions by one pixel using FFmpeg before encoding; its video path discards GIF transparency. Saving the same clip as MP4/MKV remains the NVEncC save node's job.
+
+## Upscaling guide
+
+- Connect **NVEncC Upscale (NGX VSR)** to the save node's `filters` input.
+- Select `height` for targets such as 720 or 1080, or `width` when the horizontal size matters. The other dimension is calculated as an even value from the source aspect ratio.
+- Quality `4` is the recommended offline default; lower values trade restoration quality for speed.
+- The target must be larger than the corresponding source dimension. This node does not provide downscaling.
+- NGX VSR uses the files included with the Windows x64 NVEncC package and does not require a separate model or runtime download.
 
 ## Sharpening guide
 
@@ -44,6 +64,7 @@ The former **Save Video with NVEncC (Legacy All-in-One)** remains registered und
 - **EdgeLevel:** direct outline enhancement with separate dark and bright edge controls. Start at strength `5`, threshold `20`, and leave black/white at `0` until needed.
 - **MSharpen:** a strong general-purpose choice for compressed video. Its protection controls can reduce dark-noise and block enhancement.
 - **DetailSharpen:** emphasizes fine texture. Increase damping if grain or compression texture becomes prominent.
+- **WarpSharp:** tightens edges through geometric displacement rather than simple contrast. Start with threshold `128`, blur `2`, and depth `16`; use adaptive depth to limit strong-edge distortion.
 
 Strong filters or stacked sharpen stages can create halos, ringing, block emphasis, grain, or temporal shimmer.
 

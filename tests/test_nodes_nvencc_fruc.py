@@ -1,26 +1,36 @@
 import asyncio
 import io
 import os
+import shutil
+import subprocess
 import tomllib
 import wave
 from datetime import datetime
 from pathlib import Path
 
 import torch
+import pytest
+from PIL import Image
 
 import nodes_nvencc_fruc as nvencc_module
 from nodes_nvencc_fruc import (
+    ConvertVideoToGIF,
+    LoadGIFNVEncC,
     NVEncCCAS,
     NVEncCDetailSharpen,
     NVEncCEdgeLevel,
     NVEncCFrameDouble,
     NVEncCMSharpen,
+    NVEncCNGXVSR,
     NVEncCUnsharp,
+    NVEncCWarpSharp,
     SaveVideoNVEncC,
+    SaveGIFWithFFmpeg,
     SaveVideoNVEncCFRUC,
     build_command,
     expand_date_tokens,
     get_video_input_path,
+    resolve_nvencc_filters,
     select_bridge_frames,
     write_audio_wav,
     write_y4m,
@@ -142,6 +152,7 @@ def test_suite_filter_nodes_compose_and_replace_matching_stage():
     filters = NVEncCEdgeLevel.execute(5.0, 20.0, 2.0, 1.0, filters).args[0]
     filters = NVEncCMSharpen.execute(0.8, 10.0, 0.0, 16.0, 0.5, True, filters).args[0]
     filters = NVEncCDetailSharpen.execute(4.0, 1.5, 4.0, 1.0, "box", False, filters).args[0]
+    filters = NVEncCWarpSharp.execute(128.0, 2, "13x13", 16.0, "luma mask", False, 4.0, 16.0, 192.0, 1.0, filters).args[0]
     filters = NVEncCFrameDouble.execute(filters).args[0]
     filters = NVEncCCAS.execute(0.6, filters, hdr=True, chroma=True).args[0]
 
@@ -151,14 +162,79 @@ def test_suite_filter_nodes_compose_and_replace_matching_stage():
         "edgelevel": "strength=5,threshold=20,black=2,white=1",
         "msharpen": "strength=0.8,threshold=10,slope=0,luma_limit=16,block_protect=0.5,highq=true",
         "detailsharpen": "z=4,sstr=1.5,power=4,ldmp=1,mode=1,med=false",
+        "warpsharp": "threshold=128,blur=2,type=0,depth=16,chroma=0",
         "fruc": "double",
     }
 
 
+def test_warpsharp_builds_adaptive_depth_parameters():
+    filters = NVEncCWarpSharp.execute(160.0, 3, "5x5", 8.0, "per-channel", True, 4.0, 12.0, 192.0, 0.7).args[0]
+
+    assert filters == {
+        "warpsharp": "threshold=160,blur=3,type=1,depth=8,chroma=1,depth_min=4,depth_max=12,edge_thr=192,gamma=0.7",
+    }
+
+
+def test_ngx_vsr_node_composes_and_replaces_matching_stage():
+    filters = NVEncCCAS.execute(0.3).args[0]
+    filters = NVEncCNGXVSR.execute("height", 1080, 4, filters).args[0]
+    filters = NVEncCNGXVSR.execute("width", 1920, 3, filters).args[0]
+
+    assert filters == {
+        "cas": "sharpness=0.3",
+        "ngx_vsr": {
+            "target_dimension": "width",
+            "target_size": 1920,
+            "quality": 3,
+        },
+    }
+
+
+def test_resolve_ngx_vsr_preserves_aspect_ratio_and_builds_filter():
+    filters = NVEncCNGXVSR.execute("height", 1080, 4).args[0]
+
+    resolved, width, height = resolve_nvencc_filters(filters, 640, 360)
+
+    assert (width, height) == (1920, 1080)
+    assert resolved["ngx_vsr"] == {
+        "parameters": "algo=ngx-vsr,vsr-quality=4",
+        "output_res": "1920x1080",
+    }
+
+
+def test_resolve_ngx_vsr_rejects_invalid_targets():
+    for filters, message in (
+        (NVEncCNGXVSR.execute("height", 360, 4).args[0], "larger than"),
+        (NVEncCNGXVSR.execute("height", 1081, 4).args[0], "even number"),
+        (NVEncCNGXVSR.execute("depth", 1080, 4).args[0], "height or width"),
+    ):
+        try:
+            resolve_nvencc_filters(filters, 640, 360)
+        except ValueError as error:
+            assert message in str(error)
+        else:
+            raise AssertionError("invalid NGX VSR target must be rejected")
+
+
+def test_build_command_adds_ngx_vsr_output_size(tmp_path):
+    filters = NVEncCNGXVSR.execute("height", 1080, 4).args[0]
+    filters, _, _ = resolve_nvencc_filters(filters, 640, 360)
+
+    command = build_command("NVEncC64.exe", str(tmp_path / "output.mkv"), "h264", "p4", 20.0, fruc=False, filters=filters)
+
+    assert command[command.index("--output-res") + 1] == "1920x1080"
+    assert command[command.index("--vpp-resize") + 1] == "algo=ngx-vsr,vsr-quality=4"
+
+
 def test_build_command_emits_suite_filters_in_nvencc_order(tmp_path):
     filters = {
+        "ngx_vsr": {
+            "parameters": "algo=ngx-vsr,vsr-quality=4",
+            "output_res": "1920x1080",
+        },
         "fruc": "double",
         "detailsharpen": "z=4,sstr=1.5,power=4,ldmp=1,mode=1,med=false",
+        "warpsharp": "threshold=128,blur=2,type=0,depth=16,chroma=0",
         "cas": "sharpness=0.4",
         "msharpen": "strength=0.8,threshold=10",
         "edgelevel": "strength=5,threshold=20,black=0,white=0",
@@ -167,7 +243,7 @@ def test_build_command_emits_suite_filters_in_nvencc_order(tmp_path):
 
     command = build_command("NVEncC64.exe", str(tmp_path / "output.mkv"), "h264", "p4", 20.0, fruc=False, filters=filters)
 
-    arguments = [command.index(name) for name in ("--vpp-unsharp", "--vpp-edgelevel", "--vpp-msharpen", "--vpp-cas", "--vpp-detailsharpen", "--vpp-fruc")]
+    arguments = [command.index(name) for name in ("--vpp-resize", "--vpp-unsharp", "--vpp-edgelevel", "--vpp-msharpen", "--vpp-cas", "--vpp-detailsharpen", "--vpp-warpsharp", "--vpp-fruc")]
     assert arguments == sorted(arguments)
 
 
@@ -207,6 +283,136 @@ def test_suite_save_node_applies_filter_chain_to_native_video(monkeypatch, tmp_p
     assert command[command.index("--vpp-msharpen") + 1].startswith("strength=0.8")
     assert command[command.index("--vpp-fruc") + 1] == "double"
     assert "--audio-copy" in command
+
+
+def test_suite_save_node_resolves_ngx_vsr_output_dimensions(monkeypatch, tmp_path):
+    class Video:
+        def get_dimensions(self):
+            return 640, 360
+
+        def get_stream_source(self):
+            return str(tmp_path / "input.mp4")
+
+        def get_active_trim_window(self):
+            return 0.0, 0.0
+
+        def get_frame_rate(self):
+            return 24.0
+
+    commands = []
+    save_dimensions = []
+    filters = NVEncCNGXVSR.execute("height", 1080, 4).args[0]
+    monkeypatch.setattr(nvencc_module, "find_nvencc", lambda path: "NVEncC64.exe")
+    monkeypatch.setattr(
+        nvencc_module.folder_paths,
+        "get_save_image_path",
+        lambda prefix, output_dir, width, height: (save_dimensions.append((width, height)) or (str(tmp_path), "test", 1, "", "test")),
+    )
+    monkeypatch.setattr(nvencc_module, "run_nvencc_video", commands.append)
+
+    SaveVideoNVEncC.execute(Video(), 24.0, "test", "mp4", "h264", "p4", 20.0, "hardware", "", filters)
+
+    assert save_dimensions == [(1920, 1080)]
+    command = commands[0]
+    assert command[command.index("--output-res") + 1] == "1920x1080"
+    assert command[command.index("--vpp-resize") + 1] == "algo=ngx-vsr,vsr-quality=4"
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required for GIF output")
+def test_gif_video_round_trip_with_explicit_dithering(monkeypatch, tmp_path):
+    ffmpeg = shutil.which("ffmpeg")
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    output_dir.mkdir()
+    monkeypatch.setattr(nvencc_module.folder_paths, "input_directory", str(input_dir))
+    monkeypatch.setattr(nvencc_module.folder_paths, "output_directory", str(output_dir))
+    subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+                    "testsrc2=size=256x256:rate=10:duration=0.3", "-y", str(input_dir / "source.gif")], check=True)
+
+    schema = LoadGIFNVEncC.define_schema()
+    assert "source.gif" in schema.inputs[0].options
+    video = LoadGIFNVEncC.execute("source.gif").args[0]
+    assert video.get_dimensions() == (256, 256)
+
+    commands = []
+    monkeypatch.setattr(nvencc_module, "find_nvencc", lambda path: "NVEncC64.exe")
+    monkeypatch.setattr(nvencc_module, "run_nvencc_video", commands.append)
+    SaveVideoNVEncC.execute(video, 24.0, "nvencc", "mp4", "h264", "p4", 20.0, "hardware", "")
+    assert commands[0][1:4] == ["--avsw", "-i", str(input_dir / "source.gif")]
+
+    saved = SaveGIFWithFFmpeg.execute(video, "bayer", 2, "gif", ffmpeg).args[0]
+    assert saved.get_dimensions() == (256, 256)
+    with nvencc_module.av.open(saved.get_stream_source()) as container:
+        assert sum(1 for _ in container.decode(video=0)) == 3
+
+    output_gifs = list(output_dir.rglob("*.gif"))
+    converted = ConvertVideoToGIF.execute(video, "sierra2_4a", 2, ffmpeg).args[0]
+    assert isinstance(converted.get_stream_source(), io.BytesIO)
+    assert converted.get_container_format() == "gif"
+    assert list(output_dir.rglob("*.gif")) == output_gifs
+    with nvencc_module.av.open(converted.get_stream_source()) as container:
+        assert sum(1 for _ in container.decode(video=0)) == 3
+
+    def check_buffered_gif(command):
+        assert command[1] == "--avsw"
+        with nvencc_module.av.open(command[command.index("-i") + 1]) as container:
+            assert container.format.name == "gif"
+
+    monkeypatch.setattr(nvencc_module, "run_nvencc_video", check_buffered_gif)
+    SaveVideoNVEncC.execute(converted, 24.0, "converted", "mp4", "h264", "p4", 20.0, "hardware", "")
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required for GIF output")
+def test_gif_converter_keeps_source_audio_in_video_connection(monkeypatch, tmp_path):
+    ffmpeg = shutil.which("ffmpeg")
+    source_path = tmp_path / "source.mp4"
+    subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+                    "testsrc2=size=256x256:rate=10:duration=0.5", "-f", "lavfi", "-i",
+                    "sine=frequency=440:duration=0.5", "-c:v", "libx264", "-c:a", "aac",
+                    "-shortest", "-y", str(source_path)], check=True)
+    source = nvencc_module.InputImpl.VideoFromFile(str(source_path))
+
+    converted = ConvertVideoToGIF.execute(source, "sierra2_4a", 2, ffmpeg).args[0]
+    assert isinstance(converted.get_stream_source(), io.BytesIO)
+    with nvencc_module.av.open(converted.get_stream_source()) as container:
+        assert container.streams.video[0].codec_context.name == "ffv1"
+        assert container.streams.audio[0].codec_context.name == "aac"
+
+    def check_command(command):
+        assert command[1] == "--avsw"
+        assert "--audio-copy" in command
+        with nvencc_module.av.open(command[command.index("-i") + 1]) as container:
+            assert container.streams.video[0].codec_context.name == "ffv1"
+            assert container.streams.audio[0].codec_context.name == "aac"
+
+    monkeypatch.setattr(nvencc_module, "find_nvencc", lambda path: "NVEncC64.exe")
+    monkeypatch.setattr(nvencc_module.folder_paths, "get_save_image_path", lambda *args: (str(tmp_path), "test", 1, "", "test"))
+    monkeypatch.setattr(nvencc_module, "run_nvencc_video", check_command)
+    SaveVideoNVEncC.execute(converted, 24.0, "test", "mp4", "h264", "p4", 20.0, "hardware", "")
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required to pad odd GIF dimensions")
+def test_odd_gif_is_padded_before_nvencc(monkeypatch, tmp_path):
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    output_dir.mkdir()
+    monkeypatch.setattr(nvencc_module.folder_paths, "input_directory", str(input_dir))
+    monkeypatch.setattr(nvencc_module.folder_paths, "output_directory", str(output_dir))
+    first = Image.new("RGB", (255, 255), "red")
+    second = Image.new("RGB", (255, 255), "blue")
+    first.save(input_dir / "odd.gif", save_all=True, append_images=[second], duration=100, loop=0)
+    video = LoadGIFNVEncC.execute("odd.gif").args[0]
+
+    def check_padded_input(command):
+        assert command[1] == "--avsw"
+        with nvencc_module.av.open(command[command.index("-i") + 1]) as container:
+            assert (container.streams.video[0].width, container.streams.video[0].height) == (256, 256)
+
+    monkeypatch.setattr(nvencc_module, "find_nvencc", lambda path: "NVEncC64.exe")
+    monkeypatch.setattr(nvencc_module, "run_nvencc_video", check_padded_input)
+    SaveVideoNVEncC.execute(video, 24.0, "odd", "mp4", "h264", "p4", 20.0, "hardware", "")
 
 
 def test_execute_maps_independent_sharpening_widgets_to_nvencc(monkeypatch, tmp_path):
@@ -289,11 +495,15 @@ def test_suite_node_schemas_are_stable_and_fully_documented():
     expected_inputs = {
         SaveVideoNVEncC: ["images", "filters", "fps", "filename_prefix", "container", "codec", "preset", "quality", "input_decoder", "nvencc_path", "audio"],
         NVEncCFrameDouble: ["filters"],
+        NVEncCNGXVSR: ["filters", "target_dimension", "target_size", "quality"],
         NVEncCCAS: ["filters", "strength", "hdr", "chroma"],
         NVEncCUnsharp: ["filters", "radius", "weight", "threshold"],
         NVEncCEdgeLevel: ["filters", "strength", "threshold", "black", "white"],
         NVEncCMSharpen: ["filters", "strength", "threshold", "slope", "luma_limit", "block_protect", "high_quality"],
         NVEncCDetailSharpen: ["filters", "zero_point", "strength", "power", "damping", "blur_mode", "median"],
+        NVEncCWarpSharp: ["filters", "threshold", "blur", "blur_type", "depth", "chroma_mode", "adaptive_depth", "depth_min", "depth_max", "edge_threshold", "gamma"],
+        SaveGIFWithFFmpeg: ["video", "dither", "bayer_scale", "filename_prefix", "ffmpeg_path"],
+        ConvertVideoToGIF: ["video", "dither", "bayer_scale", "ffmpeg_path"],
     }
 
     for node, input_ids in expected_inputs.items():
@@ -317,6 +527,18 @@ def test_suite_node_schemas_are_stable_and_fully_documented():
     for input_id in ("hdr", "chroma"):
         assert "true" in cas_inputs[input_id].tooltip.lower()
         assert "false" in cas_inputs[input_id].tooltip.lower()
+    warpsharp_inputs = {input.id: input for input in NVEncCWarpSharp.define_schema().inputs}
+    assert "true" in warpsharp_inputs["adaptive_depth"].tooltip.lower()
+    assert "false" in warpsharp_inputs["adaptive_depth"].tooltip.lower()
+    gif_schema = SaveGIFWithFFmpeg.define_schema()
+    gif_dither = next(input for input in gif_schema.inputs if input.id == "dither")
+    assert all(option in gif_dither.tooltip for option in gif_dither.options)
+    convert_schema = ConvertVideoToGIF.define_schema()
+    convert_dither = next(input for input in convert_schema.inputs if input.id == "dither")
+    assert all(option in convert_dither.tooltip for option in convert_dither.options)
+    assert LoadGIFNVEncC.define_schema().description
+    assert all(input.tooltip for input in LoadGIFNVEncC.define_schema().inputs)
+    assert all(output.tooltip for output in LoadGIFNVEncC.define_schema().outputs)
 
 
 def test_real_loader_registers_node_and_frontend(monkeypatch):
@@ -330,12 +552,12 @@ def test_real_loader_registers_node_and_frontend(monkeypatch):
 
     assert asyncio.run(nodes.load_custom_node(str(module_path)))
     assert {
-        "SaveVideoNVEncC", "NVEncCFrameDouble", "NVEncCCAS", "NVEncCUnsharp", "NVEncCEdgeLevel", "NVEncCMSharpen",
-        "NVEncCDetailSharpen", "SaveVideoNVEncCFRUC", "NVEncCFRUCTailBridge",
+        "LoadGIFNVEncC", "SaveGIFWithFFmpeg", "ConvertVideoToGIF", "SaveVideoNVEncC", "NVEncCFrameDouble", "NVEncCNGXVSR", "NVEncCCAS", "NVEncCUnsharp", "NVEncCEdgeLevel", "NVEncCMSharpen",
+        "NVEncCDetailSharpen", "NVEncCWarpSharp", "SaveVideoNVEncCFRUC", "NVEncCFRUCTailBridge",
     }.issubset(nodes.NODE_CLASS_MAPPINGS)
     for node_id in (
-        "SaveVideoNVEncC", "NVEncCFrameDouble", "NVEncCCAS", "NVEncCUnsharp", "NVEncCEdgeLevel", "NVEncCMSharpen",
-        "NVEncCDetailSharpen", "SaveVideoNVEncCFRUC", "NVEncCFRUCTailBridge",
+        "LoadGIFNVEncC", "SaveGIFWithFFmpeg", "ConvertVideoToGIF", "SaveVideoNVEncC", "NVEncCFrameDouble", "NVEncCNGXVSR", "NVEncCCAS", "NVEncCUnsharp", "NVEncCEdgeLevel", "NVEncCMSharpen",
+        "NVEncCDetailSharpen", "NVEncCWarpSharp", "SaveVideoNVEncCFRUC", "NVEncCFRUCTailBridge",
     ):
         assert nodes.NODE_CLASS_MAPPINGS[node_id].RELATIVE_PYTHON_MODULE == f"custom_nodes.{module_path.name}"
     assert expected_web_dir in nodes.EXTENSION_WEB_DIRS.values()
